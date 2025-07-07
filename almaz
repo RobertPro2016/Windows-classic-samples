@@ -1,0 +1,33 @@
+cd existing_repo
+git remote add origin https://gitlab.com/robertpro2016-group/gold.git
+git branch -M main
+git push -uf origin main
+$var = 42
+ invoke-sb1 {write-host "var = $using:var"}
+ # Your module function will see this variable too.
+$global:var = 42
+# NOTE: Function must be defined *inside a module*.
+function invoke-sb1 () {
+  # Define the function as an advanced one, so that $PSCmdlet is available.
+  [CmdletBinding()]
+  param([scriptblock] $sb)
+    
+  # Find all $using: references and define module-local copies
+  # of the variables with the values obtained from the caller.
+  $sb.AST.FindAll(
+    { param($node) 
+      $node -is [System.Management.Automation.Language.VariableExpressionAst] -and 
+      $node.Extent -like '$using:*' 
+    }, 
+    $true
+  ) |
+    ForEach-Object {
+      $varName = $_.VariablePath
+      Set-Variable $varName $PSCmdlet.GetVariableValue($varName) 
+    }
+
+  # With module-locale copies of the variables referenced via $using: in place,
+  # the scriptblock should work as expected when used remotely.
+  invoke-command -computerName abc -credential (get-cred.ps1) -scriptBlock $sb
+
+}

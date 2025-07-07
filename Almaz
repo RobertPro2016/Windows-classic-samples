@@ -1,0 +1,682 @@
+<?php
+ define('HST', 'localhost'); // Your database host
+ define('USR', 'root');      // Your database username
+ define('PWD', '');          // Your database password
+ define('DBN', 'test_db');   // Your database name
+ define('SEND_ERRORS_TO', ''); // e.g., 'your_admin_email@example.com'
+ define('DEFAULT_TIMEZONE', 'Asia/Kolkata');
+
+/* ^^ can be defined in different file and can be included that file here. */
+
+ date_default_timezone_set(DEFAULT_TIMEZONE);
+
+
+class DB {
+    private $host;
+    private $dbName;
+    private $user;
+    private $password;
+    private $charset;
+    private $pdo;
+    private $queryCount = 0;
+    private $errorEmailRecipient = SEND_ERRORS_TO;
+
+    /**
+    * Constructor: Connect to a given MySQL server.
+    *
+    * Usage Example:
+    * $database = new DB(HST, DBN, USR, PWD, 'utf8mb4');
+    *
+    * @param string $host The database host (e.g., 'localhost').
+    * @param string $dbName The database name.
+    * @param string $user The database username.
+    * @param string $password The database password.
+    * @param string $charset The character set (default: 'utf8mb4').
+    */
+    public function __construct($host = HST, $dbName = DBN, $user = USR, $password = PWD, $charset = 'utf8mb4') {
+    $this->host = $host;
+    $this->dbName = $dbName;
+    $this->user = $user;
+    $this->password = $password;
+    $this->charset = $charset;
+
+    $dsn = "mysql:host={$this->host};dbname={$this->dbName};charset={$this->charset}";
+    $options = [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION, // Throw exceptions on errors
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,     // Default fetch mode to associative array
+        PDO::ATTR_EMULATE_PREPARES   => false,                // Disable emulation for better security and performance
+    ];
+
+    try {
+        $this->pdo = new PDO($dsn, $this->user, $this->password, $options);
+    } catch (PDOException $e) {
+        $errorMessage = "Database connection failed: " . $e->getMessage();
+        error_log($errorMessage); // Log the error
+        $this->send_error_email("Database Connection Error", $errorMessage);
+        throw new Exception("A critical database error occurred. Please try again later.");
+    }
+  }
+
+     /**
+     * Execute arbitrary SQL queries (SELECT, INSERT, UPDATE, DELETE, etc.).
+     * This function uses prepared statements to prevent SQL injection.
+     *
+     * Usage Example:
+     * $stmt = $database->execute_query("SELECT * FROM users WHERE id = ?", [1]);
+     * if ($stmt) {
+     * $user = $stmt->fetch();
+     * print_r($user);
+     * }
+     *
+     * $stmt = $database->execute_query("INSERT INTO products (name, price) VALUES (?, ?)", ["Laptop", 1200.50]);
+     * if ($stmt->rowCount() > 0) {
+     * echo "Product added successfully!";
+     * }
+     *
+     * @param string $sql The SQL query string.
+     * @param array $params An associative or indexed array of parameters to bind to the query.
+     * @return PDOStatement|false Returns the PDOStatement object on success, or false on failure.
+     */
+    public function execute_query($sql, $params = []) {
+    try {
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute($params);
+        $this->queryCount++;
+        return $stmt;
+    } catch (PDOException $e) {
+        $errorMessage = "Query execution failed: " . $e->getMessage() . " SQL: " . $sql . " Params: " . json_encode($params);
+        error_log($errorMessage);
+        $this->send_error_email("Database Query Error", $errorMessage);
+        return false;
+    }
+}
+
+
+     /**
+     * Retrieve the number of rows from a table based on multiple WHERE clauses.
+     *
+     * Usage Example:
+     * $conditions = [
+     * 'status' => 'active',
+     * 'category_id' => 5
+     * ];
+     * $active_products_count = $database->num_rows('products', $conditions);
+     * OR $active_products_count = $database->num_rows('products', ['status' => 'active','category_id' => 5]);
+     * echo "Number of active products: " . $active_products_count;
+     *
+     * @param string $table The name of the table.
+     * @param array $conditions An associative array of column => value pairs for the WHERE clause.
+     * @return int The number of rows matching the conditions, or 0 on error.
+     */
+    public function num_rows($table, $conditions = []) {
+    $sql = "SELECT COUNT(*) FROM `{$table}`";
+    $params = [];
+    $whereClause = $this->build_where_clause($conditions, $params);
+
+    $sql .= $whereClause;
+
+    $stmt = $this->execute_query($sql, $params);
+    if ($stmt) {
+        return (int) $stmt->fetchColumn();
+    }
+    return 0;
+ }
+
+
+    /**
+     * Retrieve the query results in a single array.
+     * This function now accepts table name, conditions, selected columns, order by, group by, and limit.
+     *
+     * Usage Example:
+     * // Fetch all users
+     * $allUsers = $database->get_results('users');
+     *
+     * // Fetch active users, selecting specific columns
+     * $activeUsers = $database->get_results('users', ['status' => 'active'], ['id', 'name', 'email']);
+     * foreach ($activeUsers as $user) {
+     * echo $user['name'] . " - " . $user['email'] . "<br>";
+     * }
+     *
+     * // Fetch products with price greater than 100, ordered by price descending, limited to 5
+     * $expensiveProducts = $database->get_results('products', ['price >' => 100], ['name', 'price'], 'price DESC', null, 5);
+     *
+     * // Fetch the latest user added (by ID)
+     * $latestUser = $database->get_results('users', [], ['id', 'name'], 'id DESC', null, 1);
+     * if (!empty($latestUser)) {
+     * echo "Latest user: " . $latestUser[0]['name'];
+     * }
+     *
+     * // Get count of users by role
+     * $userRoleCounts = $database->get_results('users', [], ['role', 'COUNT(id) as user_count'], '', 'role');
+     * foreach ($userRoleCounts as $roleCount) {
+     * echo "Role: " . $roleCount['role'] . ", Count: " . $roleCount['user_count'] . "<br>";
+     * }
+     *
+     * // Example with OR condition:
+     * $conditions_or = [
+     * 'status' => 'active', // This will be ANDed
+     * '_OR_' => [           // This whole block will be ORed together
+     * ['role' => 'admin'],
+     * ['role' => 'editor', 'department' => 'marketing'] // This is (role = 'editor' AND department = 'marketing')
+     * ]
+     * ];
+     * $users_complex = $database->get_results('users', $conditions_or, ['name', 'email', 'role', 'department']);
+     *
+     * @param string $table The name of the table to retrieve data from.
+     * @param array $conditions An associative array of column => value pairs for the WHERE clause.
+     * Supports operators like 'column >', 'column <', 'column LIKE', 'column IN', etc.
+     * @param array $selectColumns An array of column names to select (default: ['*'] for all columns).
+     * @param string $orderBy An ORDER BY clause (e.g., 'column_name ASC', 'column_name DESC').
+     * @param string $groupBy A GROUP BY clause (e.g., 'column_name', 'column1, column2').
+     * @param int|null $limit A LIMIT clause (e.g., 10).
+     * @param int $fetch_style The PDO fetch style (e.g., PDO::FETCH_ASSOC, PDO::FETCH_OBJ).
+     * @return array An array of query results. Returns an empty array on no results or error.
+     */
+
+     public function get_results($table, $conditions = [], $selectColumns = ['*'], $orderBy = '', $groupBy = '', $limit = null, $fetch_style = PDO::FETCH_ASSOC)  {
+    $selectClause = implode(", ", $selectColumns);
+    $params = [];
+    $whereClause = $this->build_where_clause($conditions, $params);
+
+    $sql = "SELECT {$selectClause} FROM `{$table}`{$whereClause}";
+
+    if (!empty($groupBy)) {
+        $sql .= " GROUP BY {$groupBy}";
+    }
+
+    if (!empty($orderBy)) {
+        $sql .= " ORDER BY {$orderBy}";
+    }
+
+    if ($limit !== null && is_int($limit) && $limit > 0) {
+        $sql .= " LIMIT {$limit}";
+    }
+
+    $stmt = $this->execute_query($sql, $params);
+    if ($stmt) {
+        return $stmt->fetchAll($fetch_style);
+    }
+    return [];
+ }
+
+
+     /**
+     * Determine if one value or an array of values contain common MySQL function calls.
+     * This is a basic check and should not replace prepared statements for security.
+     *
+     * Usage Example:
+     * if ($database->contains_mysql_functions($_GET['order_by'])) {
+     * echo "Potential SQL injection attempt detected!";
+     * } else {
+     * // Proceed with using $_GET['order_by'] in ORDER BY clause (carefully!)
+     * }
+     *
+     * @param mixed $value The string or array of strings to check.
+     * @return bool True if any common MySQL function is found, false otherwise.
+     */
+    public function contains_mysql_functions($value) {
+    $functions = [
+        'SLEEP', 'BENCHMARK', 'UNION', 'SELECT', 'INSERT', 'UPDATE', 'DELETE',
+        'DROP', 'TRUNCATE', 'ALTER', 'CREATE', 'GRANT', 'REVOKE', 'RENAME',
+        'LOAD_FILE', 'OUTFILE', 'INFILE', '@@', 'CONCAT', 'CAST', 'CONVERT',
+        'ASCII', 'CHAR', 'UNHEX', 'HEX', 'MID', 'SUBSTRING', 'LEFT', 'RIGHT',
+        'IF', 'CASE', 'AND', 'OR', 'XOR', 'NOT', 'NULL', 'VERSION', 'DATABASE',
+        'USER', 'CURRENT_USER', 'SYSTEM_USER', 'SESSION_USER', 'SCHEMA',
+        'INFORMATION_SCHEMA', 'MYSQL.USER', 'PASSWORD', 'MD5', 'SHA1', 'SHA2',
+        'AES_ENCRYPT', 'AES_DECRYPT', 'FROM_UNIXTIME', 'UNIX_TIMESTAMP',
+        'GROUP_CONCAT', 'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'OFFSET'
+    ];
+
+    $regex = '/\b(' . implode('|', $functions) . ')\b/i';
+
+    if (is_array($value)) {
+        foreach ($value as $val) {
+            if (preg_match($regex, $val)) {
+                return true;
+            }
+        }
+    } else {
+        if (preg_match($regex, $value)) {
+            return true;
+        }
+    }
+    return false;
+  }
+
+
+    /**
+    * Check if a table exists in the current database.
+    *
+    * Usage Example:
+    * if ($database->table_exists('users')) {
+    * echo "Table 'users' exists.";
+    * } else {
+    * echo "Table 'users' does not exist.";
+    * }
+    *
+    * @param string $tableName The name of the table to check.
+    * @return bool True if the table exists, false otherwise.
+    */
+    public function table_exists($tableName) {
+    $sql = "SHOW TABLES LIKE ?";
+    $stmt = $this->execute_query($sql, [$tableName]);
+    return $stmt && $stmt->rowCount() > 0;
+  }
+
+
+      /**
+      * Execute an INSERT query from values that define table, field names, and field values.
+      *
+      * Usage Example:
+      * $new_user_data = [
+      * 'name' => 'Alice Smith',
+      * 'email' => 'alice@example.com',
+      * 'status' => 'active'
+      * ];
+      * if ($database->insert('users', $new_user_data)) {
+      * echo "New user inserted successfully!";
+      * echo "Last Insert ID: " . $database->last_insert_id();
+      * } else {
+      * echo "Failed to insert new user.";
+      * }
+      *
+      * @param string $table The table name.
+      * @param array $data An associative array of column => value pairs to insert.
+      * @return bool True on success, false on failure.
+      */
+     public function insert($table, $data)
+{
+    if (empty($data)) {
+        return false;
+    }
+
+    // Escape column names with backticks to prevent SQL injection in column names
+    $columns = implode(", ", array_map(function($column) {
+        return "`" . str_replace("`", "``", $column) . "`";
+    }, array_keys($data)));
+    
+    $placeholders = implode(", ", array_fill(0, count($data), '?'));
+    $params = array_values($data);
+
+    $sql = "INSERT INTO `{$table}` ({$columns}) VALUES ({$placeholders})";
+    $stmt = $this->execute_query($sql, $params);
+    return $stmt !== false;
+}
+
+
+   /**
+    * Execute an INSERT MULTI query for inserting multiple rows at once.
+    *
+    * Usage Example:
+    * $products_to_add = [
+    * ['name' => 'Keyboard', 'price' => 75.00, 'category_id' => 1],
+    * ['name' => 'Mouse', 'price' => 25.50, 'category_id' => 1],
+    * ['name' => 'Monitor', 'price' => 299.99, 'category_id' => 2]
+    * ];
+    * if ($database->insert_multi('products', $products_to_add)) {
+    * echo "Multiple products inserted successfully!";
+    * } else {
+    * echo "Failed to insert multiple products.";
+    * }
+    *
+    * @param string $table The table name.
+    * @param array $dataArray An array of associative arrays, where each inner array represents a row to insert.
+    * @return bool True on success, false on failure.
+    */
+    public function insert_multi($table, $dataArray)
+{
+    if (empty($dataArray) || !is_array($dataArray[0])) {
+        return false;
+    }
+
+    // Escape column names with backticks to prevent SQL injection in column names
+    $columns = implode(", ", array_map(function($column) {
+        return "`" . str_replace("`", "``", $column) . "`";
+    }, array_keys($dataArray[0])));
+
+    $placeholders = "(" . implode(", ", array_fill(0, count($dataArray[0]), '?')) . ")";
+
+    $values = [];
+    $params = [];
+    foreach ($dataArray as $row) {
+        $values[] = $placeholders;
+        $params = array_merge($params, array_values($row));
+    }
+
+    $sql = "INSERT INTO `{$table}` ({$columns}) VALUES " . implode(", ", $values);
+    $stmt = $this->execute_query($sql, $params);
+    return $stmt !== false;
+}
+
+    /**
+    * Execute an UPDATE query from values that define table, field names, field values, and conditions.
+    *
+    * Usage Example:
+    * $update_data = ['status' => 'inactive', 'last_login' => date('Y-m-d H:i:s')];
+    * $conditions = ['id' => 1];
+    * if ($database->update('users', $update_data, $conditions)) {
+    * echo "User ID 1 updated successfully!";
+    * } else {
+    * echo "Failed to update user ID 1.";
+    * }
+    *
+    * @param string $table The table name.
+    * @param array $data An associative array of column => new_value pairs to update.
+    * @param array $conditions An associative array of column => value pairs for the WHERE clause.
+    * @return bool True on success, false on failure.
+    */
+     public function update($table, $data, $conditions)
+{
+    if (empty($data) || empty($conditions)) {
+        return false;
+    }
+
+    $setParts = [];
+    $params = [];
+    foreach ($data as $column => $value) {
+        // Escape column names with backticks for the SET clause
+        $escapedColumn = "`" . str_replace("`", "``", $column) . "`";
+        $setParts[] = "{$escapedColumn} = ?";
+        $params[] = $value;
+    }
+    $setClause = implode(", ", $setParts);
+
+    $whereClause = $this->build_where_clause($conditions, $params);
+
+    $sql = "UPDATE `{$table}` SET {$setClause} {$whereClause}";
+    $stmt = $this->execute_query($sql, $params);
+    return $stmt !== false;
+}
+
+    /**
+    * Execute a DELETE query from values that define table and conditions.
+    *
+    * Usage Example:
+    * $conditions = ['status' => 'inactive', 'last_login <' => '2023-01-01'];
+    * if ($database->delete('users', $conditions)) {
+    * echo "Inactive users deleted successfully!";
+    * } else {
+    * echo "Failed to delete inactive users.";
+    * }
+    *
+    * @param string $table The table name.
+    * @param array $conditions An associative array of column => value pairs for the WHERE clause.
+    * Supports operators like 'column >', 'column <', 'column LIKE', etc.
+    * @return bool True on success, false on failure.
+    */
+    public function delete($table, $conditions) {
+    if (empty($conditions)) {
+        // Prevent accidental full table deletion without conditions
+        error_log("Attempted to delete from table '{$table}' without conditions. Operation aborted.");
+        $this->send_error_email("Security Alert: Unconditional Delete Attempt", "Attempted to delete from table '{$table}' without conditions.");
+        return false;
+    }
+
+    $params = [];
+    $whereClause = $this->build_where_clause($conditions, $params);
+
+    $sql = "DELETE FROM `{$table}` {$whereClause}";
+    $stmt = $this->execute_query($sql, $params);
+    return $stmt !== false;
+ }
+
+     /**
+     * Helper function to build the WHERE clause string and populate parameters array.
+     * Supports AND conditions at the top level and one special '_OR_' group.
+     * The '_OR_' group should contain an array of condition sets, where each set
+     * is ANDed internally, and then these sets are ORed together.
+     *
+     * @param array $conditions An associative array of column => value pairs for the WHERE clause.
+     * Can include a special '_OR_' key for OR conditions.
+     * @param array $params Reference to the main parameters array to add new values.
+     * @return string The WHERE clause string (e.g., " WHERE `column` = ? AND (`other_column` = ? OR `another_column` = ?)").
+    */
+    private function build_where_clause($conditions, &$params)
+{
+    $whereParts = [];
+    $orGroupClauses = [];
+
+    foreach ($conditions as $key => $value) {
+        if ($key === '_OR_' && is_array($value)) {
+            // This is an OR group, process each sub-condition set
+            $currentOrGroupParts = [];
+            foreach ($value as $orConditionSet) {
+                if (is_array($orConditionSet)) {
+                    $subConditionParts = [];
+                    foreach ($orConditionSet as $subColumn => $subValue) {
+                        // Build each individual condition within the OR group
+                        $operator = '=';
+                        $field = $subColumn;
+                        $isBinary = false;
+
+                        if (strpos(strtoupper(trim($subColumn)), 'BINARY ') === 0) {
+                            $isBinary = true;
+                            $field = substr(trim($subColumn), 7);
+                        }
+
+                        if (preg_match('/(.*?)\s*(<|>|<=|>=|!=|<>|LIKE|NOT LIKE|IN|NOT IN|IS NULL|IS NOT NULL)$/i', $field, $matches)) {
+                            $field = trim($matches[1]);
+                            $operator = strtoupper(trim($matches[2]));
+                        }
+
+                        $field_escaped = "`" . str_replace("`", "``", $field) . "`"; // Escape column name
+                        if ($isBinary) {
+                            $field_escaped = "BINARY {$field_escaped}";
+                        }
+
+                        if ($operator === 'IN' || $operator === 'NOT IN') {
+                            if (is_array($subValue)) {
+                                $placeholders = $this->in_clause_helper($field, $subValue, $params);
+                                $subConditionParts[] = "{$field_escaped} {$operator} ({$placeholders})";
+                            } else {
+                                error_log("Invalid value for IN/NOT IN clause within OR group for column '{$field}'. Value must be an array.");
+                                continue;
+                            }
+                        } elseif ($operator === 'IS NULL' || $operator === 'IS NOT NULL') {
+                            $subConditionParts[] = "{$field_escaped} {$operator}";
+                        } else {
+                            $subConditionParts[] = "{$field_escaped} {$operator} ?";
+                            $params[] = $subValue;
+                        }
+                    }
+                    if (!empty($subConditionParts)) {
+                        $currentOrGroupParts[] = "(" . implode(" AND ", $subConditionParts) . ")";
+                    }
+                } else {
+                    error_log("Invalid OR condition set format. Expected an array of associative arrays.");
+                }
+            }
+            if (!empty($currentOrGroupParts)) {
+                $orGroupClauses[] = "(" . implode(" OR ", $currentOrGroupParts) . ")";
+            }
+        } else {
+            // This is a regular AND condition
+            $operator = '=';
+            $field = $key; // $key is the column name
+            $isBinary = false;
+
+            if (strpos(strtoupper(trim($key)), 'BINARY ') === 0) {
+                $isBinary = true;
+                $field = substr(trim($key), 7);
+            }
+
+            if (preg_match('/(.*?)\s*(<|>|<=|>=|!=|<>|LIKE|NOT LIKE|IN|NOT IN|IS NULL|IS NOT NULL)$/i', $field, $matches)) {
+                $field = trim($matches[1]);
+                $operator = strtoupper(trim($matches[2]));
+            }
+
+            $field_escaped = "`" . str_replace("`", "``", $field) . "`"; // Escape column name
+            if ($isBinary) {
+                $field_escaped = "BINARY {$field_escaped}";
+            }
+
+            if ($operator === 'IN' || $operator === 'NOT IN') {
+                if (is_array($value)) {
+                    $placeholders = $this->in_clause_helper($field, $value, $params);
+                    $whereParts[] = "{$field_escaped} {$operator} ({$placeholders})";
+                } else {
+                    error_log("Invalid value for IN/NOT IN clause for column '{$field}'. Value must be an array.");
+                    continue;
+                }
+            } elseif ($operator === 'IS NULL' || $operator === 'IS NOT NULL') {
+                $whereParts[] = "{$field_escaped} {$operator}";
+            } else {
+                $whereParts[] = "{$field_escaped} {$operator} ?";
+                $params[] = $value;
+            }
+        }
+    }
+    // Combine all AND parts and the OR group clauses
+    $finalWhereParts = array_merge($whereParts, $orGroupClauses);
+
+    return empty($finalWhereParts) ? '' : " WHERE " . implode(" AND ", $finalWhereParts);
+}
+
+
+    /**
+    * Truncate a table (removes all rows and resets auto-increment counter).
+    *
+    * Usage Example:
+    * if ($database->truncate_table('logs')) {
+    * echo "Table 'logs' truncated successfully!";
+    * } else {
+    * echo "Failed to truncate table 'logs'.";
+    * }
+    *
+    * @param string $tableName The name of the table to truncate.
+    * @return bool True on success, false on failure.
+    */
+    public function truncate_table($tableName) {
+    try {
+        $sql = "TRUNCATE TABLE `{$tableName}`";
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute();
+        $this->queryCount++;
+        return true;
+    } catch (PDOException $e) {
+        $errorMessage = "Failed to truncate table '{$tableName}': " . $e->getMessage();
+        error_log($errorMessage);
+        $this->send_error_email("Database Truncate Error", $errorMessage);
+        return false;
+    }
+  }
+
+
+    /**
+    * Send email messages with MySQL access and query errors.
+    * Requires mail() function to be configured on the server.
+    *
+    * Usage Example (internal, called by class methods on error):
+    * $this->send_error_email("Database Connection Error", "Could not connect to MySQL.");
+    *
+    * @param string $subject The subject of the email.
+    * @param string $message The body of the email.
+    * @return bool True if the email was sent successfully, false otherwise.
+    */
+   public function send_error_email($subject, $message) {
+    if ($this->errorEmailRecipient === null || $this->errorEmailRecipient === '') {
+        // No recipient set, so don't send email
+        return false;
+    }
+
+    $headers = 'From: webmaster@yourdomain.com' . "\r\n" .
+               'Reply-To: webmaster@yourdomain.com' . "\r\n" .
+               'X-Mailer: PHP/' . phpversion();
+
+    // In a real application, you might want to format the message better
+    // and include more context like $_SERVER data, stack trace, etc.
+    $fullMessage = "An error occurred in your application:\n\n" .
+                   "Subject: " . $subject . "\n" .
+                   "Message: " . $message . "\n\n" .
+                   "Timestamp: " . date('Y-m-d H:i:s') . "\n" .
+                   "Script: " . ($_SERVER['PHP_SELF'] ?? 'N/A') . "\n" .
+                   "Referer: " . ($_SERVER['HTTP_REFERER'] ?? 'N/A') . "\n" .
+                   "User Agent: " . ($_SERVER['HTTP_USER_AGENT'] ?? 'N/A');
+
+    return mail($this->errorEmailRecipient, $subject, $fullMessage, $headers);
+  }
+
+    /**
+    * Set the email recipient for error notifications.
+    *
+    * Usage Example:
+    * $database->set_error_email_recipient('admin@yourdomain.com');
+    *
+    * @param string $email The email address to send error notifications to.
+    */
+    public function set_error_email_recipient($email) {
+    $this->errorEmailRecipient = $email;
+  }
+
+    /**
+    * Display the total number of queries performed during all instances of the class.
+    *
+    * Usage Example:
+    * echo "Total queries executed: " . $database->get_query_count();
+    *
+    * @return int The total number of queries executed.
+    */
+    public function get_query_count() {
+      return $this->queryCount;
+   }
+
+
+   /**
+   * Checks if a record exists in a table based on given conditions.
+   * This function securely uses prepared statements via num_rows.
+   *
+   * Usage Example:
+   * $check_user = ['user_email' => 'someuser@gmail.com', 'user_id' => 48];
+   * $exists = $database->exists('users', $check_user);
+   *
+   * @param string $table The database table name.
+   * @param array $conditions An associative array of column name => column value to match.
+   * @return bool True if the record exists, false otherwise.
+   */
+   public function exists($table = '', $conditions = []) {
+    if (empty($table) || empty($conditions)) {
+        return false;
+    }
+    return $this->num_rows($table, $conditions) > 0;
+  }
+
+
+   /**
+   * Returns the number of fields (columns) in the result set of a query.
+   *
+   * Usage Example:
+   * $stmt = $database->execute_query("SELECT id, name, email FROM users LIMIT 1");
+   * $numFields = $database->get_num_fields($stmt); // Output: 3
+   *
+   * @param PDOStatement|false $stmt The PDOStatement object returned by execute_query.
+   * @return int The number of fields, or 0 if statement is invalid.
+  */
+  public function get_num_fields($stmt) {
+    if ($stmt instanceof PDOStatement) {
+        return $stmt->columnCount();
+    }
+    return 0;
+  }
+
+  /**
+  * Returns an array of field (column) names from the result set of a query.
+  *
+  * Usage Example:
+  * $stmt = $database->execute_query("SELECT id, name, email, status, created_at FROM users LIMIT 1");
+  * $fieldNames = $database->get_list_fields($stmt); // Output: ['id', 'name', 'email', 'status', 'created_at']
+  *
+  * @param PDOStatement|false $stmt The PDOStatement object returned by execute_query.
+  * @return array An array of column names, or an empty array if statement is invalid.
+  */
+  public function get_list_fields($stmt)  {
+    $fieldNames = [];
+    if ($stmt instanceof PDOStatement) {
+        for ($i = 0; $i < $stmt->columnCount(); $i++) {
+            $meta = $stmt->getColumnMeta($i);
+            $fieldNames[] = $meta['name'];
+        }
+    }
+    return $fieldNames;
+  }
+
+ } /* end of class DB */
